@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -91,6 +90,10 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             patch(f"{_INDEXER}.is_cuda", return_value=True),
             patch(f"{_INDEXER}.is_hip", return_value=False),
+            patch(
+                f"{_INDEXER}.get_platform",
+                return_value=SimpleNamespace(device_sm=overrides.get("device_sm", 90)),
+            ),
             get_parallel().override(attn_cp_size=1),
             patch(
                 f"{_INDEXER}.is_in_tc_piecewise_cuda_graph",
@@ -122,6 +125,8 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             {"prefill_graph": True},
             {"piecewise_graph": True},
             {"fp4": True},
+            {"device_sm": 80},
+            {"device_sm": 120},
         ):
             with self.subTest(case=case):
                 self.assertFalse(self._is_eligible(**case))
