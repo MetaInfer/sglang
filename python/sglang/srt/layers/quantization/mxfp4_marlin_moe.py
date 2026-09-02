@@ -17,6 +17,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def is_mxfp4_marlin_supported() -> bool:
+    platform = get_platform()
+    return platform.device_sm == 80 or platform.is_sm90 or platform.is_sm120
+
+
 def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
     """Build the Marlin quant_info for an MXFP4 MoE layer.
 
@@ -142,8 +147,8 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if not get_platform().is_sm90 and not get_platform().is_sm120:
-            raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+        if not is_mxfp4_marlin_supported():
+            raise RuntimeError("MXFP4 Marlin requires SM80, SM90, or SM120.")
 
         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
             raise RuntimeError(
