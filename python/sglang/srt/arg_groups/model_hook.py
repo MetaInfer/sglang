@@ -44,6 +44,30 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _configure_deepseek_v4_cuda_capability_envs() -> None:
+    platform = get_platform()
+    if not platform.is_cuda:
+        return
+
+    device_sm = platform.device_sm
+    if device_sm is not None and device_sm < 90:
+        # topk_v2 uses thread-block clusters (__cluster_dims__ / this_cluster),
+        # which are unavailable on Ampere. The v1 kernel is the SM80 fallback.
+        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+
+        # DeepSeek-V4 reads this flag into a module-level constant. Resolve it
+        # before importing the model so Ampere cannot enter the DeepGEMM W_o
+        # FP8 path, even though a later serving hook also validates the flag.
+        envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+    if not ENABLE_JIT_DEEPGEMM:
+        # Resolve the default-on flag before model loading so MHC prewarm and
+        # forward both use the existing TileLang fallback.
+        envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+
+
 def handle_model_specific_adjustments(server_args: Any):
 
     cfg = resolving_view(server_args)
@@ -331,6 +355,8 @@ def handle_model_specific_adjustments(server_args: Any):
 
         validate_deepseek_v4_cp(server_args)
         validate_deepseek_v4_mega_moe_token_budget(server_args)
+
+        _configure_deepseek_v4_cuda_capability_envs()
 
         if get_platform().is_sm120:
             # SM120 lacks tcgen05/TMEM: disable features that depend on
