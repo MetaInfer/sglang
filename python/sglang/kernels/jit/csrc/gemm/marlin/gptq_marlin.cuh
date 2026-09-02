@@ -28,6 +28,10 @@
 #include "kernel.h"
 #include "marlin_template.h"
 
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+
 namespace sglang {
 
 namespace device::marlin {
@@ -134,6 +138,40 @@ typedef struct {
   int blocks_per_sm;
   thread_config_t tb_cfg;
 } exec_config_t;
+
+// Override the number of CTAs for latency-bound FP8 decode GEMMs. A positive
+// integer selects an exact grid. "a800" selects a shape-aware preset tuned on
+// the 108-SM A800. Values are capped at the SM count because the standard
+// Marlin workspace has one lock per SM. The default path is unchanged when the
+// variable is unset or invalid.
+inline int get_fp8_m1_grid_setting() {
+  static const int grid_setting = []() {
+    const char* value = std::getenv("SGLANG_MARLIN_FP8_M1_GRID");
+    if (value == nullptr || value[0] == '\0') return 0;
+    if (std::strcmp(value, "a800") == 0) return -1;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || end[0] != '\0' || parsed <= 0 || parsed > INT_MAX) return 0;
+    return static_cast<int>(parsed);
+  }();
+  return grid_setting;
+}
+
+inline int get_a800_fp8_m1_grid_blocks(int thread_n, int thread_k, int prob_n, int prob_k, int sms) {
+  if (sms != 108) return 0;
+
+  const int n_tiles = prob_n / thread_n;
+  const int k_tiles = prob_k / thread_k;
+  if (n_tiles <= 1) return 8;
+  if (n_tiles <= 4) return 12;
+  if (n_tiles <= 8) return k_tiles <= 8 ? 12 : 20;
+  if (n_tiles <= 12) return 36;
+  if (n_tiles <= 32) {
+    if (k_tiles <= 2) return 12;
+    if (k_tiles <= 8) return 36;
+  }
+  return sms;
+}
 
 int get_scales_cache_size(
     thread_config_t const& th_config,
@@ -661,6 +699,14 @@ void marlin_mm(
     thread_k = thread_tfg.thread_k;
     thread_n = thread_tfg.thread_n;
     int blocks = sms * exec_cfg.blocks_per_sm;
+    if (q_type == host::kFE4M3fn && prob_m == 1) {
+      const int grid_setting = get_fp8_m1_grid_setting();
+      const int requested_grid_blocks =
+          grid_setting == -1 ? get_a800_fp8_m1_grid_blocks(thread_n, thread_k, prob_n, prob_k, sms) : grid_setting;
+      if (requested_grid_blocks > 0 && requested_grid_blocks <= sms) {
+        blocks = requested_grid_blocks;
+      }
+    }
     if (exec_cfg.blocks_per_sm > 1) max_shared_mem_new = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
     int thread_k_blocks = thread_k / 16;
