@@ -8,6 +8,22 @@ from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
+_E4M3_LUT_CACHE = {}
+
+
+def _e4m3_lut(device: torch.device) -> torch.Tensor:
+    lookup = _E4M3_LUT_CACHE.get(device)
+    if lookup is None:
+        lookup = (
+            torch.arange(256, dtype=torch.uint8)
+            .view(fp8_dtype)
+            .to(torch.float32)
+            .to(device)
+        )
+        _E4M3_LUT_CACHE[device] = lookup
+    return lookup
+
+
 # v4 KV cache layout (see dsv4.index_buf_accessor._set_k_and_s_triton_kernel):
 #   per-token: 448 fp8 nope + 64 bf16 rope (= 576 contiguous bytes) +
 #              7 ue8m0 scales padded to 8 bytes.
@@ -50,8 +66,6 @@ def dequantize_k_cache_paged(
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
-    # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
     buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
 
@@ -67,7 +81,7 @@ def dequantize_k_cache_paged(
 
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
-        buf_fp8,
+        _e4m3_lut(quant_k_cache.device),
         buf_bf16,
         buf_uint8,
         page_table_1_flattened,
@@ -222,7 +236,7 @@ def cast_q_fp8_for_q8kv8_prefill(
 @triton.jit
 def _dequantize_k_cache_paged_kernel(
     output_ptr,
-    buf_fp8_ptr,
+    e4m3_lut_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
     page_table_ptr,
@@ -253,7 +267,8 @@ def _dequantize_k_cache_paged_kernel(
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+        fp8_bytes = tl.load(buf_uint8_ptr + fp8_off).to(tl.int32)
+        fp8_vals = tl.load(e4m3_lut_ptr + fp8_bytes)
 
         scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
         scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
