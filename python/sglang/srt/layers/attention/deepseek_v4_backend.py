@@ -104,6 +104,13 @@ C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
+def _use_sparse_decode_fallback() -> bool:
+    platform = get_platform()
+    return platform.is_sm120 or (
+        _is_cuda and platform.device_sm is not None and platform.device_sm < 90
+    )
+
+
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
@@ -149,7 +156,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if get_platform().is_sm120 or _is_xpu:
+    if _use_sparse_decode_fallback() or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1790,10 +1797,10 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # sparse_prefill_fwd does not support SM120.
+            # sparse_prefill_fwd requires an architecture-specific AOT kernel.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not get_platform().is_sm120
+                and not _use_sparse_decode_fallback()
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1819,7 +1826,7 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if get_platform().is_sm120:
+            if _use_sparse_decode_fallback():
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )

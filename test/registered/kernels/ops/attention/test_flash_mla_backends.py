@@ -25,7 +25,6 @@ import unittest
 from unittest import mock
 
 import torch
-
 from sglang.kernels.ops.attention import flash_mla_sm120 as fmod
 from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _BYTES_PER_DST_PAGE,
@@ -60,6 +59,7 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 _BYTES_PER_TOKEN = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 576 + 8 = 584
 
 _IS_SM120 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+_IS_SM80 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 0)
 
 
 def _build_kvcache(
@@ -237,7 +237,10 @@ class TestGatherAndDequant(CustomTestCase):
         )
 
 
-@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
+@unittest.skipUnless(
+    _IS_SM120 or _IS_SM80,
+    "SM80 or SM120 required for the portable Triton sparse decode test",
+)
 class TestSparseDecodeTritonVsTorch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -449,19 +452,19 @@ class TestEntryPointDispatch(CustomTestCase):
         q, indices = _build_q_indices(1, 4, 32, 4, 64, device=self.device, seed=13)
         topk_length = torch.tensor([32], dtype=torch.int32, device=self.device)
 
-        kwargs = dict(
-            q=q,
-            k_cache=k_cache,
-            indices=indices,
-            topk_length=topk_length,
-            attn_sink=None,
-            head_dim_v=_D,
-            softmax_scale=_D**-0.5,
-        )
+        kwargs = {
+            "q": q,
+            "k_cache": k_cache,
+            "indices": indices,
+            "topk_length": topk_length,
+            "attn_sink": None,
+            "head_dim_v": _D,
+            "softmax_scale": _D**-0.5,
+        }
 
-        with mock.patch.object(fmod, "_sm120_default_backend", "torch"):
+        with mock.patch.object(fmod, "_sparse_decode_backend", "torch"):
             out_torch, _ = flash_mla_with_kvcache_sm120(**kwargs)
-        with mock.patch.object(fmod, "_sm120_default_backend", "triton"):
+        with mock.patch.object(fmod, "_sparse_decode_backend", "triton"):
             out_triton, _ = flash_mla_with_kvcache_sm120(**kwargs)
 
         torch.testing.assert_close(
@@ -482,19 +485,19 @@ class TestEntryPointDispatch(CustomTestCase):
         q, indices = _build_q_indices(1, 4, 32, 4, 64, device=self.device, seed=13)
         topk_length = torch.tensor([32], dtype=torch.int32, device=self.device)
 
-        kwargs = dict(
-            q=q,
-            k_cache=k_cache,
-            indices=indices,
-            topk_length=topk_length,
-            attn_sink=None,
-            head_dim_v=_D,
-            softmax_scale=_D**-0.5,
-        )
+        kwargs = {
+            "q": q,
+            "k_cache": k_cache,
+            "indices": indices,
+            "topk_length": topk_length,
+            "attn_sink": None,
+            "head_dim_v": _D,
+            "softmax_scale": _D**-0.5,
+        }
 
-        with mock.patch.object(fmod, "_sm120_default_backend", "triton"):
+        with mock.patch.object(fmod, "_sparse_decode_backend", "triton"):
             out_triton, _ = flash_mla_with_kvcache_sm120(**kwargs)
-        with mock.patch.object(fmod, "_sm120_default_backend", "flashinfer"):
+        with mock.patch.object(fmod, "_sparse_decode_backend", "flashinfer"):
             out_fi, _ = flash_mla_with_kvcache_sm120(**kwargs)
 
         torch.testing.assert_close(

@@ -205,15 +205,29 @@ def _sm120_sparse_decode_fwd(
     return out.to(torch.bfloat16), lse.permute(0, 2, 1)
 
 
-# SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
-# Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
-_sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+def _resolve_sparse_decode_backend() -> str:
+    """Resolve a backend that is executable on the current CUDA architecture."""
+    backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+    if (
+        backend == "flashinfer"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] < 9
+    ):
+        # FlashInfer's sparse MLA kernel is unavailable before Hopper. This is
+        # a capability requirement, so an explicit unsupported selection is
+        # routed to the portable Triton implementation as well as the default.
+        return "triton"
+    return backend
+
+
+_sparse_decode_backend = _resolve_sparse_decode_backend()
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
     """SM120 FlashMLA sparse decode entry point.
 
-    Dispatches to FlashInfer (default if available), Triton, or PyTorch fallback.
+    Dispatches to FlashInfer, Triton, an optional FlashMLA CUDA extension, or
+    the PyTorch fallback.
     """
     q = kwargs["q"]
     k_cache = kwargs["k_cache"]
@@ -228,7 +242,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
 
-    if _sm120_default_backend == "flashinfer":
+    if _sparse_decode_backend == "flashinfer":
         return _flash_mla_flashinfer(
             q,
             k_cache,
@@ -242,7 +256,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
             extra_topk_length,
         )
 
-    if _sm120_default_backend == "triton":
+    if _sparse_decode_backend == "triton":
         from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
             flash_mla_sparse_decode_triton,
         )
@@ -260,6 +274,34 @@ def flash_mla_with_kvcache_sm120(**kwargs):
             extra_topk_length,
         )
         return (out, lse)
+
+    if _sparse_decode_backend == "flashmla_cuda":
+        try:
+            import flash_mla
+        except ImportError as exc:
+            raise ImportError(
+                "SGLANG_SM120_FLASHMLA_BACKEND=flashmla_cuda requires the "
+                "flash_mla CUDA extension and its package directory in PYTHONPATH."
+            ) from exc
+
+        scheduler, _ = flash_mla.get_mla_metadata()
+        return flash_mla.flash_mla_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=head_dim_v,
+            tile_scheduler_metadata=scheduler,
+            softmax_scale=softmax_scale,
+            causal=False,
+            is_fp8_kvcache=True,
+            indices=indices,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices,
+            extra_topk_length=extra_topk_length,
+        )
 
     out, lse = _sm120_sparse_decode_fwd(
         q,
