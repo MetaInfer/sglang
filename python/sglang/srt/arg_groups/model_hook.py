@@ -60,6 +60,11 @@ def _configure_deepseek_v4_cuda_capability_envs() -> None:
         # FP8 path, even though a later serving hook also validates the flag.
         envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
+        # The TileLang indexer uses an SM89 FP8 MMA instruction. Keep Ada's
+        # explicit opt-in available, but route Ampere to the portable indexer.
+        if device_sm < 89:
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(False)
+
     from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 
     if not ENABLE_JIT_DEEPGEMM:

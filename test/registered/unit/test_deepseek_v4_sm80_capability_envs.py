@@ -18,11 +18,27 @@ def test_sm80_disables_cluster_topk_fp8_wo_and_deepgemm_mhc():
         envs.SGLANG_OPT_USE_TOPK_V2.override(True),
         envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True),
         envs.SGLANG_OPT_FP8_WO_A_GEMM.override(True),
+        envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(True),
     ):
         _configure_deepseek_v4_cuda_capability_envs()
         assert not envs.SGLANG_OPT_USE_TOPK_V2.get()
         assert not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
         assert not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+        assert not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+
+
+def test_sm89_keeps_tilelang_indexer_opt_in():
+    sm89 = SimpleNamespace(is_cuda=True, device_sm=89)
+    with (
+        patch("sglang.srt.arg_groups.model_hook.get_platform", return_value=sm89),
+        patch(
+            "sglang.srt.layers.deep_gemm_wrapper.configurer.ENABLE_JIT_DEEPGEMM",
+            True,
+        ),
+        envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(True),
+    ):
+        _configure_deepseek_v4_cuda_capability_envs()
+        assert envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
 
 
 def test_sm90_keeps_supported_paths_when_deepgemm_is_available():
