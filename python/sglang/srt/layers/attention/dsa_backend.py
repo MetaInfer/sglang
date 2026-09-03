@@ -430,6 +430,9 @@ class DeepseekSparseAttnBackend(
         super().__init__()
         self.forward_metadata: DSAMetadata
         self.device = model_runner.device
+        self.supports_deep_gemm_paged_mqa = is_cuda() and (
+            torch.cuda.get_device_capability(self.device)[0] >= 9
+        )
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
@@ -842,12 +845,12 @@ class DeepseekSparseAttnBackend(
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or (dsa_impl == "flashmla_sparse" and self.device_sm_major < 9)
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            f"not supported by the selected DSA {phase} backend."
         )
 
     def _resolve_kpool_tail_backend(
@@ -910,6 +913,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        if not self.supports_deep_gemm_paged_mqa:
+            return
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
@@ -991,6 +996,8 @@ class DeepseekSparseAttnBackend(
         return getattr(self.token_to_kv_pool, "slots_per_page", self.real_page_size)
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
+        if not self.supports_deep_gemm_paged_mqa:
+            return False
         if self.device_sm_major == 9:
             return self.num_q_heads in (32, 64)
         return True
@@ -1648,9 +1655,10 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if self.supports_deep_gemm_paged_mqa:
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -2003,9 +2011,10 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            if self.supports_deep_gemm_paged_mqa:
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -2500,9 +2509,13 @@ class DeepseekSparseAttnBackend(
             index_kpool=self.dsa_index_kpool,
         )
 
-        dg_in_graph = not self.ingraph_verify_metadata_dg_out_of_graph
-        num_sms = deep_gemm.get_num_sms()
+        dg_in_graph = (
+            self.supports_deep_gemm_paged_mqa
+            and not self.ingraph_verify_metadata_dg_out_of_graph
+        )
         if dg_in_graph:
+            num_sms = deep_gemm.get_num_sms()
+            assert metadata.paged_mqa_schedule_metadata is not None
             # Copy into the static buffer to keep the captured destination stable.
             metadata.paged_mqa_schedule_metadata.copy_(
                 deep_gemm.get_paged_mqa_logits_metadata(schedule_src_2d, 64, num_sms)
@@ -2525,7 +2538,8 @@ class DeepseekSparseAttnBackend(
         )
 
         residual_launch = None
-        if not dg_in_graph:
+        if self.supports_deep_gemm_paged_mqa and not dg_in_graph:
+            num_sms = deep_gemm.get_num_sms()
             residual_launch = self._build_ingraph_verify_dg_residual(
                 metadata,
                 next_n,
@@ -3473,6 +3487,20 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.device_sm_major < 9:
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+                triton_sparse_mla_fwd,
+            )
+
+            return triton_sparse_mla_fwd(
+                q_nope=q_all[..., :v_head_dim],
+                q_rope=q_all[..., v_head_dim:],
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
+
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)

@@ -1,10 +1,8 @@
-"""Triton sparse-MLA forward for the DSA fp8 prefill path.
+"""Portable Triton sparse-MLA forward for DSA.
 
-A per-query flash-attention kernel over the indexer-selected topk KV. On
-gfx950 this is ~1.6x faster than the TileLang partial+combine kernel for the
-prefill regime (n_groups=1): the attention tile is tiny (M=16 heads = one
-16x16 MFMA), so a small-warp per-program kernel avoids the intra-block
-coordination overhead of the 256-thread TileLang block.
+A per-query flash-attention kernel over the indexer-selected topk KV. It
+supports BF16 and FP8 tensors and serves as the SM80 fallback when the
+FlashMLA AOT sparse kernel is unavailable.
 """
 
 import torch
@@ -60,16 +58,17 @@ def _sparse_mla_fwd_kernel(
 
     h = tl.arange(0, H)
     dv = tl.arange(0, D_V)
-    dt = tl.arange(0, D_TAIL)
     # q is read as two separate tensors (q_nope width D_V, q_rope width D_TAIL):
     # the upstream concat into a single [.., DIM] tensor is skipped since this
     # kernel splits q into main/tail anyway.
     q_main = tl.load(q_nope_ptr + s_i * H * D_V + h[:, None] * D_V + dv[None, :]).to(
         q_nope_ptr.dtype.element_ty
     )  # [H, D_V]
-    q_tail = tl.load(
-        q_rope_ptr + s_i * H * D_TAIL + h[:, None] * D_TAIL + dt[None, :]
-    ).to(q_nope_ptr.dtype.element_ty)  # [H, D_TAIL]
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
+        q_tail = tl.load(
+            q_rope_ptr + s_i * H * D_TAIL + h[:, None] * D_TAIL + dt[None, :]
+        ).to(q_nope_ptr.dtype.element_ty)  # [H, D_TAIL]
 
     m_i = tl.full([H], -float("inf"), tl.float32)
     l_i = tl.zeros([H], tl.float32)
@@ -85,12 +84,14 @@ def _sparse_mla_fwd_kernel(
         kv_main = tl.load(kbase + dv[None, :], mask=valid[:, None], other=0.0).to(
             q_nope_ptr.dtype.element_ty
         )  # [BLOCK_N, D_V] -- reused as V
-        kv_tail = tl.load(
-            kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-        ).to(q_nope_ptr.dtype.element_ty)  # [BLOCK_N, D_TAIL]
+        if D_TAIL > 0:
+            kv_tail = tl.load(
+                kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+            ).to(q_nope_ptr.dtype.element_ty)  # [BLOCK_N, D_TAIL]
 
         qk = tl.dot(q_main, tl.trans(kv_main)).to(tl.float32)
-        qk += tl.dot(q_tail, tl.trans(kv_tail)).to(tl.float32)
+        if D_TAIL > 0:
+            qk += tl.dot(q_tail, tl.trans(kv_tail)).to(tl.float32)
         qk = qk * sm_scale
         qk = tl.where(valid[None, :], qk, -float("inf"))
 
@@ -124,8 +125,8 @@ def triton_sparse_mla_fwd(
     sm_scale: float,
     d_v: int = 512,
 ) -> torch.Tensor:
-    """q_nope: [seq, H, d_v] fp8, q_rope: [seq, H, dim-d_v] fp8,
-    kv: [num_pages, 1, dim] fp8, indices: [seq, 1, topk].
+    """q_nope: [seq, H, d_v], q_rope: [seq, H, dim-d_v],
+    kv: [num_pages, 1, dim], indices: [seq, 1, topk].
 
     Reads q from the two un-concatenated tensors directly (no q_nope/q_rope
     concat). Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.

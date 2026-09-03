@@ -4,6 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.quantization.fp8_utils import (
+    e4m3fn_to_uint8,
+    use_fp8_e4b15_for_e4m3fn,
+)
+
 
 # Triton implementation
 @triton.jit
@@ -17,6 +22,7 @@ def _act_quant_kernel(
     round_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_NATIVE_FP8: tl.constexpr,
 ):
     """
     Triton kernel for activation quantization.
@@ -71,10 +77,11 @@ def _act_quant_kernel(
     scale_broadcast = scale[:, None]
     y = x / scale_broadcast
     y = tl.minimum(tl.maximum(y, fp8_min), fp8_max)
+    y_u8 = e4m3fn_to_uint8(y, USE_NATIVE_FP8)
 
     # Store quantized output
     y_ptrs = Y_ptr + rows[:, None] * N + cols[None, :]
-    tl.store(y_ptrs, y, mask=mask)
+    tl.store(y_ptrs, y_u8, mask=mask)
 
     # Store scales
     s_cols = pid_n
@@ -122,7 +129,7 @@ def act_quant(
 
     _act_quant_kernel[grid](
         x_flat,
-        y_flat,
+        y_flat.view(torch.uint8),
         s_flat,
         M,
         N,
@@ -130,6 +137,7 @@ def act_quant(
         round_scale=round_scale,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        USE_NATIVE_FP8=not use_fp8_e4b15_for_e4m3fn(device=x.device.index),
         num_stages=0 if round_scale else 2,
     )
 
