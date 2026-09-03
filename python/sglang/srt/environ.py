@@ -1491,6 +1491,10 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Opt in to the external FlashMLA CUDA/SM80 BF16 sparse-decode
+    # specialization for GLM-5.3. Unsupported shapes or a missing extension
+    # retain the portable Triton path.
+    SGLANG_DSA_SM80_FLASHMLA = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)

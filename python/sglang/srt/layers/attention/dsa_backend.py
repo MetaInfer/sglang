@@ -3363,6 +3363,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+                use_sm80_decode_extension=True,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_all is None:
@@ -3486,8 +3487,21 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
+        use_sm80_decode_extension: bool = False,
     ) -> torch.Tensor:
         if self.device_sm_major < 9:
+            if use_sm80_decode_extension:
+                output = self._try_forward_flashmla_sm80_decode(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    v_head_dim=v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=sm_scale,
+                    topk_length=topk_length,
+                )
+                if output is not None:
+                    return output
+
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
             )
@@ -3554,6 +3568,60 @@ class DeepseekSparseAttnBackend(
             o = o[:, :num_heads, :]
 
         return o
+
+    def _try_forward_flashmla_sm80_decode(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        topk_length: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        num_tokens = q_all.shape[0] if q_all.ndim == 3 else -1
+        if (
+            not envs.SGLANG_DSA_SM80_FLASHMLA.get()
+            or self.device_capability != (8, 0)
+            or q_all.dtype != torch.bfloat16
+            or kv_cache.dtype != torch.bfloat16
+            or q_all.ndim != 3
+            or kv_cache.ndim != 3
+            or kv_cache.shape[1] != 1
+            or q_all.shape[-1] != 512
+            or v_head_dim != 512
+            or kv_cache.shape[-1] != 512
+            or page_table_1.ndim != 2
+            or page_table_1.dtype != torch.int32
+            or page_table_1.shape[0] != num_tokens
+            or topk_length is None
+            or topk_length.ndim != 1
+            or topk_length.dtype != torch.int32
+            or topk_length.shape[0] != num_tokens
+        ):
+            return None
+
+        try:
+            from flash_mla import flash_mla_sparse_decode_bf16_sm80
+        except (ImportError, OSError, AttributeError) as error:
+            print_warning_once(
+                "SGLANG_DSA_SM80_FLASHMLA is enabled, but the GLM "
+                f"FlashMLA extension is unavailable ({error!r}); "
+                "falling back to Triton sparse MLA."
+            )
+            return None
+
+        print_warning_once(
+            "Using external FlashMLA CUDA/SM80 BF16 sparse decode "
+            "for GLM's 512-dimensional absorbed DSA."
+        )
+        output = flash_mla_sparse_decode_bf16_sm80(
+            q=q_all.contiguous(),
+            kv=kv_cache.contiguous(),
+            indices=page_table_1.contiguous(),
+            sm_scale=sm_scale,
+            topk_length=topk_length.contiguous(),
+        )
+        return output.unsqueeze(0)
 
     def q8kv8_born_fp8_q_eligible(
         self, forward_batch: ForwardBatch, num_heads: int
