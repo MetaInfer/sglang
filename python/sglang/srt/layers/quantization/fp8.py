@@ -67,7 +67,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     resolve_mxfp8_dense_gemm_backend,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_fp8_layer_for_marlin,
+    prepare_moe_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -2193,6 +2196,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
+        if get_moe_runner_backend().is_marlin() and not self.is_fp4_expert:
+            layer.orig_dtype = self.moe_runner_config.params_dtype
+            layer.weight_block_size = self.weight_block_size
+            prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 
@@ -2388,6 +2396,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
+            or moe_runner_backend.is_marlin()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
@@ -2415,6 +2424,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
+        )
+
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+        expert_map = getattr(layer.dispatcher, "local_expert_mapping", None)
+        global_num_experts = (
+            self.moe_runner_config.num_experts if expert_map is not None else -1
+        )
+        return MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_weight,
+            w2_qweight=layer.w2_weight,
+            w13_scales=layer.w13_weight_scale,
+            w2_scales=layer.w2_weight_scale,
+            w13_g_idx_sort_indices=None,
+            w2_g_idx_sort_indices=None,
+            weight_bits=8,
+            is_fp8=True,
+            expert_map=expert_map,
+            global_num_experts=global_num_experts,
+            w13_bias=getattr(layer, "w13_weight_bias", None),
+            w2_bias=getattr(layer, "w2_weight_bias", None),
         )
 
     def apply(
@@ -2545,7 +2576,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        if self.runner.runner_backend.is_deep_gemm():
+        if self.runner.runner_backend.is_marlin():
+            quant_info = self.get_marlin_quant_info(layer)
+        elif self.runner.runner_backend.is_deep_gemm():
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
